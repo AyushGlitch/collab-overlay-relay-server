@@ -1,0 +1,21 @@
+{
+  "name": "collab-overlay-relay",
+  "version": "1.0.0",
+  "description": "WebSocket relay server for Collab Overlay — collaborative rich‑text editor",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/collab-overlay-relay-server.git"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@y/websocket-server": "^0.1.5",
+    "ws": "^8.18.0",
+    "y-protocols": "^1.0.6",
+    "y-websocket": "^3.0.0",
+    "yjs": "^13.6.0"
+  }
+}
