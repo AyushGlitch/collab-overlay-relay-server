@@ -30,6 +30,9 @@ npm install
 # Open firewall
 sudo ufw allow 1234/tcp && sudo ufw reload
 
+# Verify Open Ports
+nc -vz <your-vm-ip> 1234
+
 # Start with PM2 (auto-restart)
 sudo npm install -g pm2
 pm2 start src/server.js --name collab-relay
@@ -40,13 +43,16 @@ pm2 startup
 ## API
 
 ### `GET /rooms`
+
 Returns active rooms and client counts.
+
 ```json
 [
-  { "room": "847392", "clients": 2 },
-  { "room": "129834", "clients": 1 }
+    { "room": "847392", "clients": 2 },
+    { "room": "129834", "clients": 1 }
 ]
 ```
 
 ### `WS /<room-name>`
+
 Yjs WebSocket connection for collaborative editing.
