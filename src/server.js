@@ -1,177 +1,136 @@
 #!/usr/bin/env node
-import { WebSocket, WebSocketServer } from 'ws'
 import http from 'http'
-import { setupWSConnection } from '@y/websocket-server/utils'
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'fs'
 import { join, extname } from 'path'
 import { fileURLToPath } from 'url'
 import { dirname } from 'path'
 import { randomUUID } from 'crypto'
+import { createRequire } from 'module'
 import Busboy from 'busboy'
+
+const require = createRequire(import.meta.url)
+const ws = require('ws')
+const { setupWSConnection, docs } = require('y-websocket/bin/utils')
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const PORT = process.env.PORT || 1234
 const HOST = process.env.HOST || '0.0.0.0'
 const IMAGES_DIR = join(__dirname, '..', 'images')
 
-// activeRooms maps room name → Set of Yjs-sync WebSockets
-const activeRooms = new Map()
-// broadcastRooms maps room name → Set of broadcast WebSockets
+const yjsWss = new ws.Server({ noServer: true })
+const broadcastWss = new ws.Server({ noServer: true })
 const broadcastRooms = new Map()
 
-function logActiveRooms() {
-  const rooms = [...activeRooms.keys()]
-  console.log(`[${new Date().toISOString()}] Active rooms (${rooms.length}): ${rooms.length ? rooms.join(', ') : '(none)'}`)
+function logRooms() {
+  const rooms = [...docs.keys()].map(name => {
+    const doc = docs.get(name)
+    return `${name} (${doc?.conns?.size || 0})`
+  })
+  console.log(`[${new Date().toISOString()}] Active rooms: ${rooms.length ? rooms.join(', ') : '(none)'}`)
 }
 
-const yjsWss = new WebSocketServer({ noServer: true })
-const broadcastWss = new WebSocketServer({ noServer: true })
-
 const server = http.createServer((req, res) => {
-  // GET /rooms
   if (req.method === 'GET' && req.url === '/rooms') {
-    const rooms = [...activeRooms.entries()].map(([room, clients]) => ({
-      room,
-      clients: clients.size,
+    const result = [...docs.keys()].map(name => ({
+      room: name,
+      clients: docs.get(name)?.conns?.size || 0,
     }))
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
-    res.end(JSON.stringify(rooms))
+    res.end(JSON.stringify(result))
     return
   }
-
-  // POST /upload
   if (req.method === 'POST' && req.url === '/upload') {
     const busboy = Busboy({ headers: req.headers, limits: { fileSize: 10 * 1024 * 1024 } })
     let room, fileBuffer, filename
-
-    busboy.on('field', (name, val) => {
-      if (name === 'room') room = val
-    })
-
+    busboy.on('field', (name, val) => { if (name === 'room') room = val })
     busboy.on('file', (fieldname, file, info) => {
       filename = info.filename
       const chunks = []
       file.on('data', (chunk) => chunks.push(chunk))
-      file.on('end', () => {
-        fileBuffer = Buffer.concat(chunks)
-      })
+      file.on('end', () => { fileBuffer = Buffer.concat(chunks) })
     })
-
     busboy.on('finish', () => {
-      if (!room || !fileBuffer) {
-        res.writeHead(400)
-        res.end('Missing room or file')
-        return
-      }
+      if (!room || !fileBuffer) { res.writeHead(400); res.end('Missing room or file'); return }
       const ext = extname(filename || 'image.webp') || '.webp'
       const id = randomUUID()
       const roomDir = join(IMAGES_DIR, room)
       if (!existsSync(roomDir)) mkdirSync(roomDir, { recursive: true })
-      const destPath = join(roomDir, `${id}${ext}`)
-      createWriteStream(destPath).end(fileBuffer)
+      createWriteStream(join(roomDir, `${id}${ext}`)).end(fileBuffer)
       const url = `/images/${room}/${id}${ext}`
+      const protocol = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')
+      const host = req.headers.host || `${HOST}:${PORT}`
+      const fullUrl = `${protocol}://${host}${url}`
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
-      res.end(JSON.stringify({ url }))
+      res.end(JSON.stringify({ url, fullUrl }))
     })
-
     req.pipe(busboy)
     return
   }
-
-  // GET /images/:room/:file
   if (req.method === 'GET' && req.url.startsWith('/images/')) {
-    const path = req.url.slice('/images/'.length)
-    const safe = path.replace(/\.\./g, '')
+    const safe = req.url.slice('/images/'.length).replace(/\.\./g, '')
     const filePath = join(IMAGES_DIR, safe)
-    if (!existsSync(filePath)) {
-      res.writeHead(404)
-      res.end('Not found')
-      return
-    }
+    if (!existsSync(filePath)) { res.writeHead(404); res.end('Not found'); return }
     const ext = extname(filePath).toLowerCase()
-    const mime = ext === '.webp' ? 'image/webp' : ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'application/octet-stream'
+    const mime = ext === '.webp' ? 'image/webp' : ext === '.png' ? 'image/png' : ext === '.jpg' ? 'image/jpeg' : 'application/octet-stream'
     res.writeHead(200, { 'Content-Type': mime, 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=31536000' })
     res.end(readFileSync(filePath))
     return
   }
-
   res.writeHead(200, { 'Content-Type': 'text/plain' })
   res.end('collab-overlay relay OK')
 })
 
-// All connection logic is inside the upgrade handler callbacks below.
-// The 'connection' event does NOT fire when handleUpgrade receives a callback.
-
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host}`)
-  const client = socket.remoteAddress || request.socket?.remoteAddress || 'unknown'
 
-  // /broadcast/:room — image relay only
   if (url.pathname.startsWith('/broadcast/')) {
     const room = url.pathname.slice('/broadcast/'.length) || '(unknown)'
-
-    broadcastWss.handleUpgrade(request, socket, head, (ws) => {
-      if (!broadcastRooms.has(room)) {
-        broadcastRooms.set(room, new Set())
-      }
-      broadcastRooms.get(room).add(ws)
-
-      console.log(`[${new Date().toISOString()}] Broadcast client connected → room "${room}" from ${client}`)
-
-      ws.on('message', (data) => {
-        // Relay binary to all OTHER broadcast clients in the same room
-        const roomSet = broadcastRooms.get(room)
-        if (roomSet) {
-          for (const c of roomSet) {
-            if (c !== ws && c.readyState === WebSocket.OPEN) {
-              c.send(data)
-            }
-          }
-        }
+    broadcastWss.handleUpgrade(request, socket, head, (bws) => {
+      if (!broadcastRooms.has(room)) broadcastRooms.set(room, new Set())
+      broadcastRooms.get(room).add(bws)
+      bws.on('message', (data) => {
+        const s = broadcastRooms.get(room)
+        if (s) for (const c of s) { if (c !== bws && c.readyState === 1) c.send(data) }
       })
-
-      ws.on('close', () => {
-        const roomSet = broadcastRooms.get(room)
-        if (roomSet) {
-          roomSet.delete(ws)
-          if (roomSet.size === 0) {
-            broadcastRooms.delete(room)
-          }
+      bws.on('close', () => { 
+        const s = broadcastRooms.get(room); 
+        if (s) {
+          s.delete(bws)
+          if (s.size === 0) broadcastRooms.delete(room)
         }
-        console.log(`[${new Date().toISOString()}] Broadcast client disconnected → room "${room}" from ${client}`)
       })
     })
     return
   }
 
-  // Everything else → Yjs sync
-  const room = url.pathname.slice(1) || '(unknown)'
+  yjsWss.handleUpgrade(request, socket, head, (yws) => {
+    const room = url.pathname.slice(1) || '(unknown)'
+    const client = socket.remoteAddress || request.socket?.remoteAddress || 'unknown'
 
-  yjsWss.handleUpgrade(request, socket, head, (ws) => {
-    setupWSConnection(ws, request)
+    setupWSConnection(yws, request, { docName: room })
 
-    if (!activeRooms.has(room)) {
-      activeRooms.set(room, new Set())
-    }
-    activeRooms.get(room).add(ws)
+    const doc = docs.get(room)
+    const count = doc?.conns?.size || 0
+    console.log(`[${new Date().toISOString()}] Client connected → "${room}" from ${client} (${count} total)`)
+    logRooms()
 
-    console.log(`[${new Date().toISOString()}] Client connected → room "${room}" from ${client}`)
-    logActiveRooms()
+    yws.on('close', () => {
+      const remaining = doc?.conns?.size || 0
+      console.log(`[${new Date().toISOString()}] Client disconnected → "${room}" from ${client} (${remaining} remaining)`)
 
-    ws.on('close', () => {
-      const roomSet = activeRooms.get(room)
-      if (roomSet) {
-        roomSet.delete(ws)
-        if (roomSet.size === 0) {
-          activeRooms.delete(room)
-        }
+      if (remaining === 0) {
+        setTimeout(() => {
+          const stillEmpty = (docs.get(room)?.conns?.size || 0) === 0
+          if (stillEmpty && docs.has(room)) {
+            docs.delete(room)
+            console.log(`[${new Date().toISOString()}] Room "${room}" freed (0 clients remaining)`)
+          }
+        }, 10_000) // wait 10s before actually freeing, in case of a quick reconnect
       }
-      console.log(`[${new Date().toISOString()}] Client disconnected → room "${room}" from ${client}`)
-      logActiveRooms()
+
+      logRooms()
     })
   })
 })
 
-server.listen(PORT, HOST, () => {
-  console.log(`Relay server listening on ${HOST}:${PORT}`)
-})
+server.listen(PORT, HOST, () => console.log(`Relay listening on ${HOST}:${PORT}`))
